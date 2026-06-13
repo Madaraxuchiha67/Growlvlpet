@@ -1,0 +1,1756 @@
+--[[
+    ╔══════════════════════════════════════════════════════════╗
+    ║               GAG : PET LEVELING v1.1                    ║
+    ║            Grow a Garden - Auto Leveling Tool            ║
+    ╠══════════════════════════════════════════════════════════╣
+    ║  Features:                                               ║
+    ║  • Auto Leveling with pet queue system                   ║
+    ║  • Auto Nightmare farming with auto-cleanse              ║
+    ║  • Auto Elephant weight farming (Jumbo Blessing)         ║
+    ║  • Real-time age, weight & mutation tracking             ║
+    ║  • Smart slot switching based on cooldowns               ║
+    ╠══════════════════════════════════════════════════════════╣
+    ║  UI Library: Rayfield                                    ║
+    ╚══════════════════════════════════════════════════════════╝
+--]]
+
+-- Rayfield UI Library
+local Rayfield = loadstring(game:HttpGet("https://sirius.menu/rayfield"))()
+
+-- Services
+local Players     = game:GetService("Players")
+local RS          = game:GetService("ReplicatedStorage")
+local VirtualUser = game:GetService("VirtualUser")
+
+local player       = Players.LocalPlayer
+local petsPhysical = workspace:WaitForChild("PetsPhysical")
+
+-- Remotes
+local Events              = RS:WaitForChild("GameEvents")
+local PetCooldownsUpdated = Events:FindFirstChild("PetCooldownsUpdated")
+local RequestPetCooldowns = Events:FindFirstChild("RequestPetCooldowns")
+local PetsService         = Events:WaitForChild("PetsService")
+local PetShardService_RE  = Events:FindFirstChild("PetShardService_RE")
+local Notification        = Events:FindFirstChild("Notification")
+
+-- DataService
+local DataService = require(RS.Modules.DataService)
+
+-- Anti-AFK (default ON)
+local antiAfkEnabled = true
+
+-- Discord Webhook
+local webhookUrl     = ""
+local webhookEnabled = false
+
+-- Mutation detection
+local lastMutationResult = nil
+local lastMutationName   = nil
+
+-- Elephant detection
+local lastElephantResult = nil
+local lastElephantWeight = nil
+
+-- Ferret detection (V2)
+local v2TriggerCount = 0
+local v2PetEquipped  = false
+local v2AutoEnabled  = false
+
+--==============================================================--
+-- Window & Tabs
+--==============================================================--
+local Window = Rayfield:CreateWindow({
+    Name             = "GAG : Pet Leveling",
+    LoadingTitle     = "GAG : Pet Leveling",
+    LoadingSubtitle  = "Grow a Garden Auto Tool",
+    ConfigurationSaving = {
+        Enabled  = true,
+        FolderName = "GagPetLeveling",
+        FileName = "Config",
+    },
+    Discord = {
+        Enabled = false,
+    },
+    KeySystem = false,
+})
+
+local MainTab      = Window:CreateTab("Auto Leveling V1",  "trending-up")
+local LevelingV2Tab= Window:CreateTab("Auto Leveling V2",  "flame")
+local NightmareTab = Window:CreateTab("Auto Nightmare",    "moon")
+local ElephantTab  = Window:CreateTab("Auto Elephant",     "weight")
+local SettingsTab  = Window:CreateTab("Settings",          "settings")
+
+--==============================================================--
+-- Helpers
+--==============================================================--
+local function setcb(s)
+    if typeof(setclipboard) == "function" then setclipboard(s) end
+end
+
+local function Notify(title, content, duration)
+    Rayfield:Notify({
+        Title    = title,
+        Content  = content,
+        Duration = duration or 3,
+        Image    = "rbxassetid://4483345998",
+    })
+end
+
+local function sendWebhook(title, description, color, fields)
+    if not webhookEnabled or webhookUrl == "" then return end
+    local HttpService = game:GetService("HttpService")
+    local embed = {
+        title       = title,
+        description = description,
+        color       = color or 5763719,
+        fields      = fields or {},
+        footer      = {text = "Grow a Garden • GAG : Pet Leveling v1.1"},
+        timestamp   = os.date("!%Y-%m-%dT%H:%M:%SZ"),
+    }
+    local data = {
+        username = "GAG Pet Leveling",
+        embeds   = {embed},
+    }
+    task.spawn(function()
+        pcall(function()
+            request({
+                Url     = webhookUrl,
+                Method  = "POST",
+                Headers = {["Content-Type"] = "application/json"},
+                Body    = HttpService:JSONEncode(data),
+            })
+        end)
+    end)
+end
+
+local function normGuid(s)
+    return string.lower((tostring(s or "")):gsub("[{}]", ""))
+end
+
+local function swapTo(slot)
+    pcall(function() PetsService:FireServer("SwapPetLoadout", slot) end)
+end
+
+local function visualToInternal(visualSlot)
+    if visualSlot == 2 then return 3
+    elseif visualSlot == 3 then return 2
+    else return visualSlot end
+end
+
+local function findPetInPetMovers(guid)
+    local PP = workspace:FindFirstChild("PetsPhysical")
+    if not PP then return nil end
+    for _, child in ipairs(PP:GetChildren()) do
+        if child.Name == "PetMover" then
+            local pet = child:FindFirstChild(guid)
+            if pet then return pet end
+        end
+    end
+    return nil
+end
+
+local function applyCleansingShardToPet(guid)
+    local Backpack  = player:FindFirstChild("Backpack")
+    local Character = player.Character
+    if not Backpack or not Character then return false, "No Backpack/Character" end
+
+    local shardTool = nil
+    for _, item in ipairs(Backpack:GetChildren()) do
+        if item.Name:find("Cleansing Pet Shard") then shardTool = item break end
+    end
+    if not shardTool then
+        for _, item in ipairs(Character:GetChildren()) do
+            if item.Name:find("Cleansing Pet Shard") then shardTool = item break end
+        end
+    end
+    if not shardTool then return false, "No Cleansing Shard!" end
+
+    local targetPet = findPetInPetMovers(guid)
+    if not targetPet then return false, "Pet not equipped!" end
+
+    shardTool.Parent = Character
+    task.wait(0.5)
+    if PetShardService_RE then PetShardService_RE:FireServer("ApplyShard", targetPet) end
+    task.wait(0.5)
+    shardTool.Parent = Backpack
+    return true, "Shard applied!"
+end
+
+-- Notification listener
+if Notification then
+    Notification.OnClientEvent:Connect(function(message)
+        if message and type(message) == "string" then
+            if message:find("twisted your") and message:find("mutation") then
+                local mutationName = message:match("<font color='[^']+'>([^<]+)</font>")
+                if mutationName then
+                    lastMutationName = mutationName
+                    lastMutationResult = (mutationName == "Nightmare") and "Nightmare" or "Other"
+                    print("[GAG Pet Leveling] Mutation detected:", mutationName)
+                end
+            end
+            if message:find("Elephant blessed your") then
+                local totalWeight = tonumber(message:match("%(([%d%.]+) KG total%)"))
+                lastElephantWeight = totalWeight
+                lastElephantResult = "Blessed"
+                print("[GAG Pet Leveling] Elephant blessing! Weight:", totalWeight, "KG")
+            elseif message:find("found no old pets below the weight cap") then
+                lastElephantResult = "MaxWeight"
+                print("[GAG Pet Leveling] Elephant: Max weight reached!")
+            end
+            if message:find("French Fry Ferret increased") then
+                v2TriggerCount = v2TriggerCount + 1
+                print("[GAG Pet Leveling] Ferret +1 level! Triggers:", v2TriggerCount)
+            end
+        end
+    end)
+end
+
+-- Anti-AFK
+player.Idled:Connect(function()
+    if antiAfkEnabled then
+        VirtualUser:CaptureController()
+        VirtualUser:ClickButton2(Vector2.new())
+        Notify("Anti-AFK", "Prevented idle kick!", 3)
+    end
+end)
+
+-- Cooldown helpers
+local function pickSeconds(v)
+    if type(v) == "number" then return math.max(0, v) end
+    if type(v) == "table" then
+        if #v >= 1 and type(v[1]) == "table" then
+            local t = v[1]
+            if t.Time      then return math.max(0, t.Time) end
+            if t.Remaining then return math.max(0, t.Remaining) end
+            if t.Ready == true then return 0 end
+        end
+        if v.Time      then return math.max(0, v.Time) end
+        if v.Remaining then return math.max(0, v.Remaining) end
+        if v.Ready == true then return 0 end
+    end
+    return nil
+end
+
+local function getCurrentSlotFromService()
+    local ok, data = pcall(function() return DataService:GetData() end)
+    if ok and data and data.PetsData and data.PetsData.SelectedPetLoadout then
+        return data.PetsData.SelectedPetLoadout
+    end
+    return nil
+end
+
+-- Mutation map
+local MUTATION_MAP = {
+    ["a"]="Shocked",["b"]="Golden",["c"]="Rainbow",["d"]="Shiny",["e"]="Windy",
+    ["f"]="Frozen",["g"]="Inverted",["h"]="Rideable",["i"]="Mega",["j"]="Tiny",
+    ["k"]="IronSkin",["l"]="Radiant",["m"]="Normal",["n"]="Ascended",["o"]="Tranquil",
+    ["p"]="Corrupted",["q"]="Fried",["r"]="Aromatic",["s"]="Silver",["t"]="GiantBean",
+    ["u"]="Glimmering",["v"]="Luminous",["w"]="Nutty",["x"]="Dreadbound",["y"]="Soulflame",
+    ["z"]="Spectral",["A"]="Nightmare",["B"]="Tethered",["H"]="Aurora",["I"]="JUMBO",
+    ["J"]="Oxpecker",["K"]="Giraffe",["L"]="Rhino",["M"]="Crocodile",["N"]="Lion",
+    ["O"]="Forger",["P"]="HyperHunger",["Q"]="Nocturnal",["R"]="Peppermint",
+}
+
+local MUTATION_ABBREV = {
+    Nightmare="NM",Rainbow="RB",Golden="GD",Shiny="SN",Rideable="RD",
+    Mega="MG",Shocked="SK",Windy="WD",Frozen="FZ",Inverted="IV",
+    Tiny="TN",IronSkin="IS",Radiant="RA",Ascended="AS",Tranquil="TQ",
+    Corrupted="CR",Fried="FR",Aromatic="AR",Silver="SV",GiantBean="GB",
+    Glimmering="GM",Luminous="LM",Nutty="NT",Dreadbound="DB",Soulflame="SF",
+    Spectral="SP",Tethered="TT",Aurora="AU",JUMBO="JB",Oxpecker="OX",
+    Giraffe="GF",Rhino="RH",Crocodile="CC",Lion="LN",Forger="FG",
+    HyperHunger="HH",Nocturnal="NC",Peppermint="PM",
+}
+
+local function getMutationName(enumId)
+    if not enumId then return "Normal" end
+    return MUTATION_MAP[enumId] or "Unknown"
+end
+
+local function getMutationAbbrev(mutationName)
+    if not mutationName or mutationName == "Normal" or mutationName == "Unknown" then return nil end
+    return MUTATION_ABBREV[mutationName]
+end
+
+local function getPetDataFromService(guid)
+    if not guid then return nil end
+    local ok, data = pcall(function() return DataService:GetData() end)
+    if not ok or not data or not data.PetsData then return nil end
+    local inv = data.PetsData.PetInventory
+    if not inv or not inv.Data then return nil end
+    local petInfo = inv.Data[guid]
+    if petInfo and petInfo.PetData then
+        local mutationType = petInfo.PetData.MutationType
+        local baseWeight   = petInfo.PetData.BaseWeight or 0
+        local age          = petInfo.PetData.Level or 1
+        return {
+            type          = petInfo.PetType or "Unknown",
+            name          = petInfo.PetData.Name or "",
+            age           = age,
+            mutationId    = mutationType,
+            mutation      = getMutationName(mutationType),
+            baseWeight    = baseWeight,
+            currentWeight = baseWeight * (1 + age / 10),
+        }
+    end
+    return nil
+end
+
+local function getAllPetsFromService()
+    local pets = {}
+    local ok, data = pcall(function() return DataService:GetData() end)
+    if not ok or not data or not data.PetsData then return pets end
+    local inv = data.PetsData.PetInventory
+    if not inv or not inv.Data then return pets end
+    for guid, petInfo in pairs(inv.Data) do
+        if guid:match("^{.*}$") and not guid:find("PetTemplate") and petInfo.PetData then
+            local mutationName = getMutationName(petInfo.PetData.MutationType)
+            table.insert(pets, {
+                guid          = guid,
+                type          = petInfo.PetType or "Unknown",
+                name          = petInfo.PetData.Name or "",
+                age           = petInfo.PetData.Level or 1,
+                mutation      = mutationName,
+                mutationAbbrev= getMutationAbbrev(mutationName),
+            })
+        end
+    end
+    table.sort(pets, function(a, b)
+        if a.type == b.type then return a.name < b.name end
+        return a.type < b.type
+    end)
+    return pets
+end
+
+local function formatPetForDropdown(pet)
+    local displayName    = pet.name ~= "" and pet.name or pet.type
+    local typeWithMutation = pet.mutationAbbrev and (pet.mutationAbbrev .. " " .. pet.type) or pet.type
+    return string.format("%s (%s) [Age %d] %s", displayName, typeWithMutation, pet.age, pet.guid)
+end
+
+--==============================================================--
+-- LEVELING V1 TAB
+--==============================================================--
+MainTab:CreateSection("Auto Leveling V1")
+
+local lvlSelectedMimic    = nil
+local lvlSelectedLeveling = nil
+local lvlSelectedPetToAdd = nil
+local lvlLevelingQueue    = {}
+local lvlCurrentQueueIndex= 1
+local lvlMimicDilopSlot   = 1
+local lvlLevelingSlot     = 2
+local lvlTargetLevel      = 30
+local lvlAutoEnabled      = false
+local lvlPetEquipped      = false
+local lvlCompletedPets    = {}
+
+local LvlMimicDropdown = MainTab:CreateDropdown({
+    Name        = "Select Mimic",
+    Options     = {"(Refresh to load)"},
+    CurrentOption = {"(Refresh to load)"},
+    MultipleOptions = false,
+    Flag        = "LvlMimic",
+    Callback    = function(v)
+        local val = type(v) == "table" and v[1] or v
+        if val and val ~= "(Refresh to load)" and val ~= "(No pets found)" then
+            lvlSelectedMimic = val:match("({.+})$")
+        else
+            lvlSelectedMimic = nil
+        end
+    end,
+})
+
+MainTab:CreateDropdown({
+    Name        = "Mimic Dilop Slot",
+    Options     = {"Slot 1","Slot 2","Slot 3","Slot 4","Slot 5","Slot 6"},
+    CurrentOption = {"Slot 1"},
+    MultipleOptions = false,
+    Flag        = "LvlMimicSlot",
+    Callback    = function(v)
+        local val = type(v) == "table" and v[1] or v
+        lvlMimicDilopSlot = tonumber(val:match("%d"))
+    end,
+})
+
+MainTab:CreateSection("Leveling Queue")
+
+local LvlLevelingDropdown = MainTab:CreateDropdown({
+    Name        = "Select Leveling Pet",
+    Options     = {"(Refresh to load)"},
+    CurrentOption = {"(Refresh to load)"},
+    MultipleOptions = false,
+    Flag        = "LvlPet",
+    Callback    = function(v)
+        local val = type(v) == "table" and v[1] or v
+        if val and val ~= "(Refresh to load)" and val ~= "(No pets found)" then
+            lvlSelectedPetToAdd = val
+        else
+            lvlSelectedPetToAdd = nil
+        end
+    end,
+})
+
+local LvlQueueLabel = MainTab:CreateLabel("Queue: (Empty)")
+
+local function updateLvlQueueDisplay()
+    if #lvlLevelingQueue == 0 then
+        LvlQueueLabel:Set("Queue: (Empty)")
+    else
+        local lines = {}
+        for i, guid in ipairs(lvlLevelingQueue) do
+            local pd = getPetDataFromService(guid)
+            if pd then
+                local name = pd.name ~= "" and pd.name or pd.type
+                local abbrev = getMutationAbbrev(pd.mutation)
+                local typeStr = abbrev and (abbrev.." "..pd.type) or pd.type
+                table.insert(lines, string.format("%d. %s (%s)", i, name, typeStr))
+            else
+                table.insert(lines, string.format("%d. %.20s...", i, guid))
+            end
+        end
+        LvlQueueLabel:Set("Queue ("..#lvlLevelingQueue.." pets):\n"..table.concat(lines, "\n"))
+    end
+end
+
+MainTab:CreateButton({
+    Name     = "Add to Queue",
+    Callback = function()
+        if not lvlSelectedPetToAdd then Notify("Error","Select a pet first!") return end
+        local guid = lvlSelectedPetToAdd:match("({.+})$")
+        if not guid then Notify("Error","Invalid pet selection") return end
+        for _, g in ipairs(lvlLevelingQueue) do
+            if g == guid then Notify("Already in Queue","This pet is already in the queue") return end
+        end
+        table.insert(lvlLevelingQueue, guid)
+        lvlSelectedLeveling = lvlLevelingQueue[1]
+        lvlCurrentQueueIndex = 1
+        updateLvlQueueDisplay()
+        local pd = getPetDataFromService(guid)
+        local petName = pd and (pd.name ~= "" and pd.name or pd.type) or "Unknown"
+        Notify("Added to Queue", petName.." (#"..#lvlLevelingQueue..")")
+    end,
+})
+
+MainTab:CreateButton({
+    Name     = "Clear Queue",
+    Callback = function()
+        lvlLevelingQueue = {}
+        lvlSelectedLeveling = nil
+        lvlCurrentQueueIndex = 1
+        updateLvlQueueDisplay()
+        Notify("Queue Cleared","All pets removed")
+    end,
+})
+
+MainTab:CreateDropdown({
+    Name        = "Leveling Slot",
+    Options     = {"Slot 1","Slot 2","Slot 3","Slot 4","Slot 5","Slot 6"},
+    CurrentOption = {"Slot 2"},
+    MultipleOptions = false,
+    Flag        = "LvlLevelingSlot",
+    Callback    = function(v)
+        local val = type(v) == "table" and v[1] or v
+        lvlLevelingSlot = tonumber(val:match("%d"))
+    end,
+})
+
+MainTab:CreateInput({
+    Name        = "Target Level",
+    CurrentValue= "30",
+    PlaceholderText = "Enter target level (1-100)",
+    RemoveTextAfterFocusLost = false,
+    Flag        = "LvlTargetLevel",
+    Callback    = function(input)
+        local num = tonumber(input)
+        if num and num >= 1 and num <= 100 then
+            lvlTargetLevel = num
+            Notify("Target Set","Will stop at Level "..lvlTargetLevel)
+        else
+            Notify("Invalid","Enter a number between 1-100")
+        end
+    end,
+})
+
+MainTab:CreateButton({
+    Name     = "Refresh Pet List",
+    Callback = function()
+        local pets = getAllPetsFromService()
+        local values = {}
+        for _, pet in ipairs(pets) do table.insert(values, formatPetForDropdown(pet)) end
+        if #pets == 0 then values = {"(No pets found)"} end
+        LvlMimicDropdown:Set(values[1] or "(No pets found)")
+        LvlLevelingDropdown:Set(values[1] or "(No pets found)")
+        lvlSelectedMimic = nil
+        lvlSelectedPetToAdd = nil
+        updateLvlQueueDisplay()
+        Notify("Success","Found "..#pets.." pets!")
+    end,
+})
+
+MainTab:CreateSection("Control")
+
+local LvlStatusLabel = MainTab:CreateLabel("Status: OFF | CD: — | Slot: —")
+
+local LvlAutoToggle = MainTab:CreateToggle({
+    Name     = "Auto Switch",
+    CurrentValue = false,
+    Flag     = "LvlAutoSwitch",
+    Callback = function(state)
+        lvlAutoEnabled = state
+        if state then
+            if not lvlSelectedMimic then
+                Notify("Error","Select Mimic first!",4)
+                LvlAutoToggle:Set(false) lvlAutoEnabled = false return
+            end
+            if #lvlLevelingQueue == 0 then
+                Notify("Error","Add pets to queue first!",4)
+                LvlAutoToggle:Set(false) lvlAutoEnabled = false return
+            end
+            lvlPetEquipped = false
+            lvlCurrentQueueIndex = 1
+            lvlSelectedLeveling = lvlLevelingQueue[1]
+            local pd = getPetDataFromService(lvlSelectedLeveling)
+            local petName = pd and (pd.name ~= "" and pd.name or pd.type) or "Unknown"
+            Notify("Leveling Started","Starting: "..petName.." (1/"..#lvlLevelingQueue..")",4)
+        else
+            if lvlPetEquipped and lvlSelectedLeveling then
+                pcall(function() PetsService:FireServer("UnequipPet", lvlSelectedLeveling) end)
+                lvlPetEquipped = false
+                Notify("Pet Unequipped","Leveling pet removed")
+            end
+            Notify("Leveling Stopped","Disabled")
+        end
+    end,
+})
+
+MainTab:CreateButton({
+    Name     = "Reset Progress",
+    Callback = function()
+        lvlCompletedPets = {}
+        lvlCurrentQueueIndex = 1
+        if #lvlLevelingQueue > 0 then lvlSelectedLeveling = lvlLevelingQueue[1] end
+        Notify("Reset Complete","Back to Pet 1",4)
+    end,
+})
+
+MainTab:CreateButton({
+    Name     = "Copy Selected GUID",
+    Callback = function()
+        if lvlSelectedLeveling then
+            setcb(lvlSelectedLeveling)
+            Notify("Copied", lvlSelectedLeveling, 4)
+        else
+            Notify("Error","No pet selected")
+        end
+    end,
+})
+
+--==============================================================--
+-- LEVELING V2 TAB
+--==============================================================--
+LevelingV2Tab:CreateSection("Auto Leveling V2 (Ferret)")
+
+local v2SelectedPetToAdd  = nil
+local v2SelectedLeveling  = nil
+local v2LevelingQueue     = {}
+local v2CurrentQueueIndex = 1
+local v2FerretSlot        = 4
+local v2TargetLevel       = 100
+local v2CompletedPets     = {}
+
+local V2LevelingDropdown = LevelingV2Tab:CreateDropdown({
+    Name        = "Select Leveling Pet",
+    Options     = {"(Refresh to load)"},
+    CurrentOption = {"(Refresh to load)"},
+    MultipleOptions = false,
+    Flag        = "V2Pet",
+    Callback    = function(v)
+        local val = type(v) == "table" and v[1] or v
+        if val and val ~= "(Refresh to load)" and val ~= "(No pets found)" then
+            v2SelectedPetToAdd = val
+        else
+            v2SelectedPetToAdd = nil
+        end
+    end,
+})
+
+local V2QueueLabel = LevelingV2Tab:CreateLabel("Queue: (Empty)")
+
+local function updateV2QueueDisplay()
+    if #v2LevelingQueue == 0 then
+        V2QueueLabel:Set("Queue: (Empty)")
+    else
+        local lines = {}
+        for i, guid in ipairs(v2LevelingQueue) do
+            local pd = getPetDataFromService(guid)
+            if pd then
+                local name = pd.name ~= "" and pd.name or pd.type
+                local abbrev = getMutationAbbrev(pd.mutation)
+                local typeStr = abbrev and (abbrev.." "..pd.type) or pd.type
+                table.insert(lines, string.format("%d. %s (%s)", i, name, typeStr))
+            else
+                table.insert(lines, string.format("%d. %.20s...", i, guid))
+            end
+        end
+        V2QueueLabel:Set("Queue ("..#v2LevelingQueue.." pets):\n"..table.concat(lines, "\n"))
+    end
+end
+
+LevelingV2Tab:CreateButton({
+    Name     = "Add to Queue",
+    Callback = function()
+        if not v2SelectedPetToAdd then Notify("Error","Select a pet first!") return end
+        local guid = v2SelectedPetToAdd:match("({.+})$")
+        if not guid then Notify("Error","Invalid pet selection") return end
+        for _, g in ipairs(v2LevelingQueue) do
+            if g == guid then Notify("Already in Queue","This pet is already in the queue") return end
+        end
+        table.insert(v2LevelingQueue, guid)
+        v2SelectedLeveling = v2LevelingQueue[1]
+        v2CurrentQueueIndex = 1
+        updateV2QueueDisplay()
+        local pd = getPetDataFromService(guid)
+        local petName = pd and (pd.name ~= "" and pd.name or pd.type) or "Unknown"
+        Notify("Added to Queue", petName.." (#"..#v2LevelingQueue..")")
+    end,
+})
+
+LevelingV2Tab:CreateButton({
+    Name     = "Clear Queue",
+    Callback = function()
+        v2LevelingQueue = {}
+        v2SelectedLeveling = nil
+        v2CurrentQueueIndex = 1
+        v2CompletedPets = {}
+        v2TriggerCount = 0
+        updateV2QueueDisplay()
+        Notify("Queue Cleared","All pets removed")
+    end,
+})
+
+LevelingV2Tab:CreateDropdown({
+    Name        = "Ferret Slot",
+    Options     = {"Slot 1","Slot 2","Slot 3","Slot 4","Slot 5","Slot 6"},
+    CurrentOption = {"Slot 4"},
+    MultipleOptions = false,
+    Flag        = "V2FerretSlot",
+    Callback    = function(v)
+        local val = type(v) == "table" and v[1] or v
+        v2FerretSlot = tonumber(val:match("%d"))
+    end,
+})
+
+LevelingV2Tab:CreateInput({
+    Name        = "Target Level",
+    CurrentValue= "100",
+    PlaceholderText = "Enter target level (1-100)",
+    RemoveTextAfterFocusLost = false,
+    Flag        = "V2TargetLevel",
+    Callback    = function(input)
+        local num = tonumber(input)
+        if num and num >= 1 and num <= 100 then
+            v2TargetLevel = num
+            Notify("Target Set","Will stop at Level "..v2TargetLevel)
+        else
+            Notify("Invalid","Enter a number between 1-100")
+        end
+    end,
+})
+
+LevelingV2Tab:CreateButton({
+    Name     = "Refresh Pet List",
+    Callback = function()
+        local pets = getAllPetsFromService()
+        local values = {}
+        for _, pet in ipairs(pets) do table.insert(values, formatPetForDropdown(pet)) end
+        if #pets == 0 then values = {"(No pets found)"} end
+        V2LevelingDropdown:Set(values[1] or "(No pets found)")
+        v2SelectedPetToAdd = nil
+        updateV2QueueDisplay()
+        Notify("Success","Found "..#pets.." pets!")
+    end,
+})
+
+LevelingV2Tab:CreateSection("Control")
+
+local V2StatusLabel = LevelingV2Tab:CreateLabel("Status: OFF | Triggers: 0 | Slot: —")
+
+local V2AutoToggle = LevelingV2Tab:CreateToggle({
+    Name     = "Auto Level (Ferret)",
+    CurrentValue = false,
+    Flag     = "V2AutoLevel",
+    Callback = function(state)
+        v2AutoEnabled = state
+        if state then
+            if #v2LevelingQueue == 0 then
+                Notify("Error","Add pets to queue first!",4)
+                V2AutoToggle:Set(false) v2AutoEnabled = false return
+            end
+            v2PetEquipped = false
+            v2CurrentQueueIndex = 1
+            v2SelectedLeveling = v2LevelingQueue[1]
+            v2CompletedPets = {}
+            v2TriggerCount = 0
+            swapTo(visualToInternal(v2FerretSlot))
+            local pd = getPetDataFromService(v2SelectedLeveling)
+            local petName = pd and (pd.name ~= "" and pd.name or pd.type) or "Unknown"
+            Notify("Leveling Started","Starting: "..petName.." (1/"..#v2LevelingQueue..")",4)
+        else
+            if v2PetEquipped and v2SelectedLeveling then
+                pcall(function() PetsService:FireServer("UnequipPet", v2SelectedLeveling) end)
+                v2PetEquipped = false
+                Notify("Pet Unequipped","Leveling pet removed")
+            end
+            Notify("Leveling Stopped","Disabled")
+        end
+    end,
+})
+
+LevelingV2Tab:CreateButton({
+    Name     = "Reset Progress",
+    Callback = function()
+        v2CompletedPets = {}
+        v2CurrentQueueIndex = 1
+        v2TriggerCount = 0
+        if #v2LevelingQueue > 0 then v2SelectedLeveling = v2LevelingQueue[1] end
+        Notify("Reset Complete","Back to Pet 1",4)
+    end,
+})
+
+LevelingV2Tab:CreateButton({
+    Name     = "Copy Selected GUID",
+    Callback = function()
+        if v2SelectedLeveling then
+            setcb(v2SelectedLeveling)
+            Notify("Copied", v2SelectedLeveling, 4)
+        else
+            Notify("Error","No pet selected")
+        end
+    end,
+})
+
+--==============================================================--
+-- NIGHTMARE TAB
+--==============================================================--
+NightmareTab:CreateSection("Auto Nightmare Farming")
+
+local nmSelectedMimic    = nil
+local nmSelectedLeveling = nil
+local nmSelectedPetToAdd = nil
+local levelingQueue      = {}
+local currentQueueIndex  = 1
+local nmMimicDilopSlot   = 1
+local nmLevelingSlot     = 2
+local nmMutationSlot     = 3
+local nmPhase            = "LEVELING"
+local nmMutationChecked  = false
+local nmCompletedPets    = {}
+local targetLevel        = 30
+local nmAutoEnabled      = false
+local nmPetEquipped      = false
+
+local NmMimicDropdown = NightmareTab:CreateDropdown({
+    Name        = "Select Mimic",
+    Options     = {"(Refresh to load)"},
+    CurrentOption = {"(Refresh to load)"},
+    MultipleOptions = false,
+    Flag        = "NmMimic",
+    Callback    = function(v)
+        local val = type(v) == "table" and v[1] or v
+        if val and val ~= "(Refresh to load)" and val ~= "(No pets found)" then
+            nmSelectedMimic = val:match("({.+})$")
+        else
+            nmSelectedMimic = nil
+        end
+    end,
+})
+
+NightmareTab:CreateDropdown({
+    Name        = "Mimic Dilop Slot",
+    Options     = {"Slot 1","Slot 2","Slot 3","Slot 4","Slot 5","Slot 6"},
+    CurrentOption = {"Slot 1"},
+    MultipleOptions = false,
+    Flag        = "NmMimicDilopSlot",
+    Callback    = function(v)
+        local val = type(v) == "table" and v[1] or v
+        nmMimicDilopSlot = tonumber(val:match("%d"))
+    end,
+})
+
+NightmareTab:CreateSection("Leveling Queue")
+
+local NmLevelingDropdown = NightmareTab:CreateDropdown({
+    Name        = "Select Leveling Pet",
+    Options     = {"(Refresh to load)"},
+    CurrentOption = {"(Refresh to load)"},
+    MultipleOptions = false,
+    Flag        = "NmLevelingPet",
+    Callback    = function(v)
+        local val = type(v) == "table" and v[1] or v
+        if val and val ~= "(Refresh to load)" and val ~= "(No pets found)" then
+            nmSelectedPetToAdd = val
+        else
+            nmSelectedPetToAdd = nil
+        end
+    end,
+})
+
+local NmQueueLabel = NightmareTab:CreateLabel("Queue: (Empty)")
+
+local function updateNmQueueDisplay()
+    if #levelingQueue == 0 then
+        NmQueueLabel:Set("Queue: (Empty)")
+    else
+        local lines = {}
+        for i, guid in ipairs(levelingQueue) do
+            local pd = getPetDataFromService(guid)
+            if pd then
+                local name = pd.name ~= "" and pd.name or pd.type
+                local abbrev = getMutationAbbrev(pd.mutation)
+                local typeStr = abbrev and (abbrev.." "..pd.type) or pd.type
+                table.insert(lines, string.format("%d. %s (%s)", i, name, typeStr))
+            else
+                table.insert(lines, string.format("%d. %.20s...", i, guid))
+            end
+        end
+        NmQueueLabel:Set("Queue ("..#levelingQueue.." pets):\n"..table.concat(lines, "\n"))
+    end
+end
+
+NightmareTab:CreateButton({
+    Name     = "Add to Queue",
+    Callback = function()
+        if not nmSelectedPetToAdd then Notify("Error","Select a pet first!") return end
+        local guid = nmSelectedPetToAdd:match("({.+})$")
+        if not guid then Notify("Error","Invalid pet selection") return end
+        for _, g in ipairs(levelingQueue) do
+            if g == guid then Notify("Already in Queue","This pet is already in the queue") return end
+        end
+        table.insert(levelingQueue, guid)
+        nmSelectedLeveling = levelingQueue[1]
+        currentQueueIndex = 1
+        updateNmQueueDisplay()
+        local pd = getPetDataFromService(guid)
+        local petName = pd and (pd.name ~= "" and pd.name or pd.type) or "Unknown"
+        Notify("Added to Queue", petName.." (#"..#levelingQueue..")")
+    end,
+})
+
+NightmareTab:CreateButton({
+    Name     = "Clear Queue",
+    Callback = function()
+        levelingQueue = {}
+        nmSelectedLeveling = nil
+        currentQueueIndex = 1
+        updateNmQueueDisplay()
+        Notify("Queue Cleared","All pets removed")
+    end,
+})
+
+NightmareTab:CreateDropdown({
+    Name        = "Leveling Slot",
+    Options     = {"Slot 1","Slot 2","Slot 3","Slot 4","Slot 5","Slot 6"},
+    CurrentOption = {"Slot 2"},
+    MultipleOptions = false,
+    Flag        = "NmLevelingSlot",
+    Callback    = function(v)
+        local val = type(v) == "table" and v[1] or v
+        nmLevelingSlot = tonumber(val:match("%d"))
+    end,
+})
+
+NightmareTab:CreateDropdown({
+    Name        = "Mutation Slot",
+    Options     = {"Slot 1","Slot 2","Slot 3","Slot 4","Slot 5","Slot 6"},
+    CurrentOption = {"Slot 3"},
+    MultipleOptions = false,
+    Flag        = "NmMutationSlot",
+    Callback    = function(v)
+        local val = type(v) == "table" and v[1] or v
+        nmMutationSlot = tonumber(val:match("%d"))
+    end,
+})
+
+NightmareTab:CreateInput({
+    Name        = "Target Level",
+    CurrentValue= "30",
+    PlaceholderText = "Enter target level (1-100)",
+    RemoveTextAfterFocusLost = false,
+    Flag        = "NmTargetLevel",
+    Callback    = function(input)
+        local num = tonumber(input)
+        if num and num >= 1 and num <= 100 then
+            targetLevel = num
+            Notify("Target Set","Will mutate at Level "..targetLevel)
+        else
+            Notify("Invalid","Enter a number between 1-100")
+        end
+    end,
+})
+
+NightmareTab:CreateButton({
+    Name     = "Refresh Pet List",
+    Callback = function()
+        local pets = getAllPetsFromService()
+        local values = {}
+        for _, pet in ipairs(pets) do table.insert(values, formatPetForDropdown(pet)) end
+        if #pets == 0 then values = {"(No pets found)"} end
+        NmMimicDropdown:Set(values[1] or "(No pets found)")
+        NmLevelingDropdown:Set(values[1] or "(No pets found)")
+        nmSelectedMimic = nil
+        nmSelectedPetToAdd = nil
+        updateNmQueueDisplay()
+        Notify("Success","Found "..#pets.." pets!")
+    end,
+})
+
+NightmareTab:CreateSection("Control")
+
+local NmStatusLabel = NightmareTab:CreateLabel("Phase: — | CD: — | Slot: —")
+
+local NmAutoToggle = NightmareTab:CreateToggle({
+    Name     = "Auto Switch",
+    CurrentValue = false,
+    Flag     = "NmAutoSwitch",
+    Callback = function(state)
+        nmAutoEnabled = state
+        if state then
+            if not nmSelectedMimic then
+                Notify("Error","Select Mimic first!",4)
+                NmAutoToggle:Set(false) nmAutoEnabled = false return
+            end
+            if #levelingQueue == 0 then
+                Notify("Error","Add pets to queue first!",4)
+                NmAutoToggle:Set(false) nmAutoEnabled = false return
+            end
+            nmPetEquipped = false
+            currentQueueIndex = 1
+            nmSelectedLeveling = levelingQueue[1]
+            local pd = getPetDataFromService(nmSelectedLeveling)
+            local petName = pd and (pd.name ~= "" and pd.name or pd.type) or "Unknown"
+            Notify("Auto Nightmare Started","Starting: "..petName.." (1/"..#levelingQueue..")",4)
+        else
+            if nmPetEquipped and nmSelectedLeveling then
+                pcall(function() PetsService:FireServer("UnequipPet", nmSelectedLeveling) end)
+                nmPetEquipped = false
+                Notify("Pet Unequipped","Leveling pet removed")
+            end
+            Notify("Auto Nightmare Stopped","Disabled")
+        end
+    end,
+})
+
+NightmareTab:CreateButton({
+    Name     = "Reset Progress",
+    Callback = function()
+        nmPhase = "LEVELING"
+        nmMutationChecked = false
+        nmCompletedPets = {}
+        currentQueueIndex = 1
+        if #levelingQueue > 0 then nmSelectedLeveling = levelingQueue[1] end
+        Notify("Reset Complete","Back to Pet 1, Phase: LEVELING",4)
+    end,
+})
+
+--==============================================================--
+-- ELEPHANT TAB
+--==============================================================--
+ElephantTab:CreateSection("Auto Elephant (Jumbo Blessing)")
+
+local elSelectedMimic    = nil
+local elSelectedElephant = nil
+local elSelectedLeveling = nil
+local elSelectedPetToAdd = nil
+local elLevelingQueue    = {}
+local elCurrentQueueIndex= 1
+local elMimicDilopSlot   = 1
+local elLevelingSlot     = 2
+local elElephantSlot     = 4
+local elTargetLevel      = 40
+local elAutoEnabled      = false
+local elPetEquipped      = false
+local elCompletedPets    = {}
+local elPhase            = "LEVELING"
+local elBlessingCount    = 0
+local elephantRemain     = nil
+
+local ElMimicDropdown = ElephantTab:CreateDropdown({
+    Name        = "Select Mimic",
+    Options     = {"(Refresh to load)"},
+    CurrentOption = {"(Refresh to load)"},
+    MultipleOptions = false,
+    Flag        = "ElMimic",
+    Callback    = function(v)
+        local val = type(v) == "table" and v[1] or v
+        if val and val ~= "(Refresh to load)" and val ~= "(No pets found)" then
+            elSelectedMimic = val:match("({.+})$")
+        else
+            elSelectedMimic = nil
+        end
+    end,
+})
+
+ElephantTab:CreateDropdown({
+    Name        = "Mimic Dilop Slot",
+    Options     = {"Slot 1","Slot 2","Slot 3","Slot 4","Slot 5","Slot 6"},
+    CurrentOption = {"Slot 1"},
+    MultipleOptions = false,
+    Flag        = "ElMimicDilopSlot",
+    Callback    = function(v)
+        local val = type(v) == "table" and v[1] or v
+        elMimicDilopSlot = tonumber(val:match("%d"))
+    end,
+})
+
+ElephantTab:CreateDropdown({
+    Name        = "Leveling Slot",
+    Options     = {"Slot 1","Slot 2","Slot 3","Slot 4","Slot 5","Slot 6"},
+    CurrentOption = {"Slot 2"},
+    MultipleOptions = false,
+    Flag        = "ElLevelingSlot",
+    Callback    = function(v)
+        local val = type(v) == "table" and v[1] or v
+        elLevelingSlot = tonumber(val:match("%d"))
+    end,
+})
+
+ElephantTab:CreateInput({
+    Name        = "Target Level (before blessing)",
+    CurrentValue= "40",
+    PlaceholderText = "Enter target level (1-100)",
+    RemoveTextAfterFocusLost = false,
+    Flag        = "ElTargetLevel",
+    Callback    = function(input)
+        local num = tonumber(input)
+        if num and num >= 1 and num <= 100 then
+            elTargetLevel = num
+            Notify("Target Set","Will level to "..elTargetLevel.." before blessing")
+        else
+            Notify("Invalid","Enter a number between 1-100")
+        end
+    end,
+})
+
+ElephantTab:CreateSection("Elephant Setup")
+
+local ElElephantDropdown = ElephantTab:CreateDropdown({
+    Name        = "Select Elephant",
+    Options     = {"(Refresh to load)"},
+    CurrentOption = {"(Refresh to load)"},
+    MultipleOptions = false,
+    Flag        = "ElElephant",
+    Callback    = function(v)
+        local val = type(v) == "table" and v[1] or v
+        if val and val ~= "(Refresh to load)" and val ~= "(No pets found)" then
+            elSelectedElephant = val:match("({.+})$")
+        else
+            elSelectedElephant = nil
+        end
+    end,
+})
+
+ElephantTab:CreateDropdown({
+    Name        = "Elephant Slot",
+    Options     = {"Slot 1","Slot 2","Slot 3","Slot 4","Slot 5","Slot 6"},
+    CurrentOption = {"Slot 4"},
+    MultipleOptions = false,
+    Flag        = "ElElephantSlot",
+    Callback    = function(v)
+        local val = type(v) == "table" and v[1] or v
+        elElephantSlot = tonumber(val:match("%d"))
+    end,
+})
+
+ElephantTab:CreateSection("Pet Queue")
+
+local ElLevelingDropdown = ElephantTab:CreateDropdown({
+    Name        = "Select Leveling Pet",
+    Options     = {"(Refresh to load)"},
+    CurrentOption = {"(Refresh to load)"},
+    MultipleOptions = false,
+    Flag        = "ElLevelingPet",
+    Callback    = function(v)
+        local val = type(v) == "table" and v[1] or v
+        if val and val ~= "(Refresh to load)" and val ~= "(No pets found)" then
+            elSelectedPetToAdd = val
+        else
+            elSelectedPetToAdd = nil
+        end
+    end,
+})
+
+local ElQueueLabel = ElephantTab:CreateLabel("Queue: (Empty)")
+
+local function updateElQueueDisplay()
+    if #elLevelingQueue == 0 then
+        ElQueueLabel:Set("Queue: (Empty)")
+    else
+        local lines = {}
+        for i, guid in ipairs(elLevelingQueue) do
+            local pd = getPetDataFromService(guid)
+            if pd then
+                local name = pd.name ~= "" and pd.name or pd.type
+                local abbrev = getMutationAbbrev(pd.mutation)
+                local typeStr = abbrev and (abbrev.." "..pd.type) or pd.type
+                local weight = string.format("%.2f", pd.currentWeight or 0)
+                table.insert(lines, string.format("%d. %s (%s) %s KG", i, name, typeStr, weight))
+            else
+                table.insert(lines, string.format("%d. %.20s...", i, guid))
+            end
+        end
+        ElQueueLabel:Set("Queue ("..#elLevelingQueue.." pets):\n"..table.concat(lines, "\n"))
+    end
+end
+
+ElephantTab:CreateButton({
+    Name     = "Add to Queue",
+    Callback = function()
+        if not elSelectedPetToAdd then Notify("Error","Select a pet first!") return end
+        local guid = elSelectedPetToAdd:match("({.+})$")
+        if not guid then Notify("Error","Invalid pet selection") return end
+        for _, g in ipairs(elLevelingQueue) do
+            if g == guid then Notify("Already in Queue","This pet is already in the queue") return end
+        end
+        table.insert(elLevelingQueue, guid)
+        elSelectedLeveling = elLevelingQueue[1]
+        elCurrentQueueIndex = 1
+        updateElQueueDisplay()
+        local pd = getPetDataFromService(guid)
+        local petName = pd and (pd.name ~= "" and pd.name or pd.type) or "Unknown"
+        Notify("Added to Queue", petName.." (#"..#elLevelingQueue..")")
+    end,
+})
+
+ElephantTab:CreateButton({
+    Name     = "Clear Queue",
+    Callback = function()
+        elLevelingQueue = {}
+        elSelectedLeveling = nil
+        elCurrentQueueIndex = 1
+        updateElQueueDisplay()
+        Notify("Queue Cleared","All pets removed")
+    end,
+})
+
+ElephantTab:CreateButton({
+    Name     = "Refresh Pet List",
+    Callback = function()
+        local pets = getAllPetsFromService()
+        local values = {}
+        for _, pet in ipairs(pets) do table.insert(values, formatPetForDropdown(pet)) end
+        if #pets == 0 then values = {"(No pets found)"} end
+        ElMimicDropdown:Set(values[1] or "(No pets found)")
+        ElElephantDropdown:Set(values[1] or "(No pets found)")
+        ElLevelingDropdown:Set(values[1] or "(No pets found)")
+        elSelectedMimic = nil
+        elSelectedElephant = nil
+        elSelectedPetToAdd = nil
+        updateElQueueDisplay()
+        Notify("Success","Found "..#pets.." pets!")
+    end,
+})
+
+ElephantTab:CreateSection("Control")
+
+local ElStatusLabel = ElephantTab:CreateLabel("Phase: — | Mimic CD: — | Elephant CD: —")
+
+local ElAutoToggle = ElephantTab:CreateToggle({
+    Name     = "Auto Switch",
+    CurrentValue = false,
+    Flag     = "ElAutoSwitch",
+    Callback = function(state)
+        elAutoEnabled = state
+        if state then
+            if not elSelectedMimic then
+                Notify("Error","Select Mimic first!",4)
+                ElAutoToggle:Set(false) elAutoEnabled = false return
+            end
+            if not elSelectedElephant then
+                Notify("Error","Select Elephant first!",4)
+                ElAutoToggle:Set(false) elAutoEnabled = false return
+            end
+            if #elLevelingQueue == 0 then
+                Notify("Error","Add pets to queue first!",4)
+                ElAutoToggle:Set(false) elAutoEnabled = false return
+            end
+            elPetEquipped = false
+            elCurrentQueueIndex = 1
+            elSelectedLeveling = elLevelingQueue[1]
+            elPhase = "LEVELING"
+            elBlessingCount = 0
+            local pd = getPetDataFromService(elSelectedLeveling)
+            local petName = pd and (pd.name ~= "" and pd.name or pd.type) or "Unknown"
+            Notify("Auto Elephant Started","Starting: "..petName.." (1/"..#elLevelingQueue..")",4)
+        else
+            if elPetEquipped and elSelectedLeveling then
+                pcall(function() PetsService:FireServer("UnequipPet", elSelectedLeveling) end)
+                elPetEquipped = false
+                Notify("Pet Unequipped","Pet has been unequipped")
+            end
+            Notify("Auto Elephant Stopped","Disabled")
+        end
+    end,
+})
+
+ElephantTab:CreateButton({
+    Name     = "Reset Progress",
+    Callback = function()
+        elPhase = "LEVELING"
+        elBlessingCount = 0
+        elCompletedPets = {}
+        elCurrentQueueIndex = 1
+        if #elLevelingQueue > 0 then elSelectedLeveling = elLevelingQueue[1] end
+        Notify("Reset Complete","Back to Pet 1, Phase: LEVELING",4)
+    end,
+})
+
+--==============================================================--
+-- SETTINGS TAB
+--==============================================================--
+SettingsTab:CreateSection("General Settings")
+
+SettingsTab:CreateToggle({
+    Name         = "Anti-AFK",
+    CurrentValue = true,
+    Flag         = "AntiAfk",
+    Callback     = function(state)
+        antiAfkEnabled = state
+        Notify("Anti-AFK", state and "Enabled" or "Disabled")
+    end,
+})
+
+SettingsTab:CreateSection("Discord Webhook")
+
+SettingsTab:CreateToggle({
+    Name         = "Enable Webhook",
+    CurrentValue = false,
+    Flag         = "WebhookEnabled",
+    Callback     = function(state)
+        webhookEnabled = state
+        Notify("Webhook", state and "Enabled" or "Disabled")
+    end,
+})
+
+SettingsTab:CreateInput({
+    Name        = "Webhook URL",
+    CurrentValue= "",
+    PlaceholderText = "https://discord.com/api/webhooks/...",
+    RemoveTextAfterFocusLost = false,
+    Flag        = "WebhookURL",
+    Callback    = function(input)
+        webhookUrl = input
+        Notify("Webhook URL", "URL has been set!")
+    end,
+})
+
+SettingsTab:CreateButton({
+    Name     = "Test Webhook",
+    Callback = function()
+        if webhookUrl == "" then
+            Notify("Error","Set webhook URL first!")
+            return
+        end
+        local prev = webhookEnabled
+        webhookEnabled = true
+        sendWebhook("Test Notification","GAG : Pet Leveling webhook is working!",5763719,{})
+        webhookEnabled = prev
+        Notify("Webhook Test","Sent! Check your Discord channel.")
+    end,
+})
+
+SettingsTab:CreateSection("About")
+SettingsTab:CreateLabel("GAG : Pet Leveling v1.1")
+SettingsTab:CreateLabel("Grow a Garden Auto Leveling Tool")
+SettingsTab:CreateLabel("UI: Rayfield Library")
+
+--==============================================================--
+-- COOLDOWN TRACKING
+--==============================================================--
+local READY_EPS      = 0.05
+local READY_HOLD_SEC = 0.30
+local POLL_SEC       = 2.5
+local TICK_SEC       = 0.25
+
+local mimicRemain  = nil
+local currentSlot  = 1
+local readyHoldTimer = 0
+
+if PetCooldownsUpdated then
+    PetCooldownsUpdated.OnClientEvent:Connect(function(a, b)
+        local lvlKey      = lvlSelectedMimic   and normGuid(lvlSelectedMimic) or nil
+        local nmKey       = nmSelectedMimic    and normGuid(nmSelectedMimic) or nil
+        local elMimicKey  = elSelectedMimic    and normGuid(elSelectedMimic) or nil
+        local elElephKey  = elSelectedElephant and normGuid(elSelectedElephant) or nil
+
+        local function tryMimic(a_, b_, key)
+            if a_ and b_ and normGuid(a_) == key then
+                local s = pickSeconds(b_)
+                if s ~= nil then mimicRemain = s end
+                return true
+            end
+            return false
+        end
+
+        local function tryElephant(a_, b_, key)
+            if a_ and b_ and normGuid(a_) == key then
+                local s = pickSeconds(b_)
+                if s ~= nil then elephantRemain = s end
+                return true
+            end
+            return false
+        end
+
+        if lvlKey     then tryMimic(a, b, lvlKey) end
+        if nmKey      then tryMimic(a, b, nmKey) end
+        if elMimicKey then tryMimic(a, b, elMimicKey) end
+        if elElephKey then tryElephant(a, b, elElephKey) end
+
+        if type(a) == "table" and not b then
+            for k, v in pairs(a) do
+                local nk = normGuid(k)
+                if nk == lvlKey or nk == nmKey or nk == elMimicKey then
+                    local s = pickSeconds(v)
+                    if s ~= nil then mimicRemain = s end
+                end
+                if nk == elElephKey then
+                    local s = pickSeconds(v)
+                    if s ~= nil then elephantRemain = s end
+                end
+            end
+        end
+    end)
+end
+
+-- Polling
+task.spawn(function()
+    while true do
+        if RequestPetCooldowns then
+            pcall(function() RequestPetCooldowns:FireServer() end)
+            if lvlSelectedMimic   then pcall(function() RequestPetCooldowns:FireServer(lvlSelectedMimic) end) end
+            if nmSelectedMimic    then pcall(function() RequestPetCooldowns:FireServer(nmSelectedMimic) end) end
+            if elSelectedMimic    then pcall(function() RequestPetCooldowns:FireServer(elSelectedMimic) end) end
+            if elSelectedElephant then pcall(function() RequestPetCooldowns:FireServer(elSelectedElephant) end) end
+        end
+        task.wait(POLL_SEC)
+    end
+end)
+
+currentSlot = getCurrentSlotFromService() or 1
+
+--==============================================================--
+-- MAIN LOOP
+--==============================================================--
+task.spawn(function()
+    while true do
+        task.wait(TICK_SEC)
+
+        -- Decay timers
+        if type(mimicRemain) == "number" then
+            mimicRemain = math.max(0, mimicRemain - TICK_SEC)
+        end
+        if type(elephantRemain) == "number" then
+            elephantRemain = math.max(0, elephantRemain - TICK_SEC)
+        end
+
+        local realSlot = getCurrentSlotFromService()
+        if realSlot then currentSlot = realSlot end
+
+        -- Visual slot (2 and 3 are swapped in DataService)
+        local visualSlot = currentSlot
+        if currentSlot == 2 then visualSlot = 3
+        elseif currentSlot == 3 then visualSlot = 2 end
+
+        local cdTxt   = mimicRemain and string.format("%.2fs", mimicRemain) or "—"
+        local slotTxt = "Slot "..visualSlot
+
+        --== LEVELING V1 UI ==--
+        do
+            local pd = getPetDataFromService(lvlSelectedLeveling)
+            local petName = pd and (pd.name ~= "" and pd.name or pd.type) or "—"
+            local petAge  = pd and pd.age or 0
+            local mut     = pd and pd.mutation or "—"
+            local eqTxt   = lvlPetEquipped and "YES" or "NO"
+            local qTxt    = #lvlLevelingQueue > 0 and (lvlCurrentQueueIndex.."/"..#lvlLevelingQueue) or "0/0"
+            local modeTxt = lvlAutoEnabled and "ON" or "OFF"
+            LvlStatusLabel:Set(string.format(
+                "Mode: %s | CD: %s | Slot: %s | Pet: %s [%s] | Age: %d/%d | Queue: %s | Done: %d | Equipped: %s",
+                modeTxt, cdTxt, slotTxt, petName, mut, petAge, lvlTargetLevel, qTxt, #lvlCompletedPets, eqTxt
+            ))
+        end
+
+        --== LEVELING V1 LOGIC ==--
+        if lvlAutoEnabled and lvlSelectedLeveling then
+            local pd      = getPetDataFromService(lvlSelectedLeveling)
+            local petAge  = pd and pd.age or 0
+            local petName = pd and (pd.name ~= "" and pd.name or pd.type) or "Unknown"
+            local petType = pd and pd.type or "Unknown"
+
+            if visualSlot == lvlLevelingSlot and not lvlPetEquipped then
+                pcall(function()
+                    PetsService:FireServer("EquipPet", lvlSelectedLeveling, CFrame.new())
+                end)
+                lvlPetEquipped = true
+                Notify("Pet Equipped", petName.." ("..lvlCurrentQueueIndex.."/"..#lvlLevelingQueue..")")
+            end
+
+            if visualSlot == lvlMimicDilopSlot and lvlPetEquipped then
+                pcall(function() PetsService:FireServer("UnequipPet", lvlSelectedLeveling) end)
+                lvlPetEquipped = false
+            end
+
+            if petAge >= lvlTargetLevel then
+                if lvlPetEquipped then
+                    pcall(function() PetsService:FireServer("UnequipPet", lvlSelectedLeveling) end)
+                    lvlPetEquipped = false
+                end
+                Notify("Level Complete!", petName.." reached Level "..lvlTargetLevel.."!", 5)
+                sendWebhook("Level Complete!","Pet reached target level",5763719,{
+                    {name="Pet",value=petName,inline=true},{name="Type",value=petType,inline=true},
+                    {name="Level",value=tostring(lvlTargetLevel),inline=true},
+                    {name="Queue",value=lvlCurrentQueueIndex.."/"..#lvlLevelingQueue,inline=true},
+                })
+                table.insert(lvlCompletedPets, lvlSelectedLeveling)
+                if lvlCurrentQueueIndex < #lvlLevelingQueue then
+                    lvlCurrentQueueIndex = lvlCurrentQueueIndex + 1
+                    lvlSelectedLeveling = lvlLevelingQueue[lvlCurrentQueueIndex]
+                    local np = getPetDataFromService(lvlSelectedLeveling)
+                    local npName = np and (np.name ~= "" and np.name or np.type) or "Unknown"
+                    Notify("Next Pet","Now leveling: "..npName.." ("..lvlCurrentQueueIndex.."/"..#lvlLevelingQueue..")",5)
+                else
+                    lvlAutoEnabled = false
+                    LvlAutoToggle:Set(false)
+                    Notify("ALL COMPLETE!","All "..#lvlCompletedPets.." pets leveled!",15)
+                    sendWebhook("ALL COMPLETE!","All pets leveled!",5814783,{
+                        {name="Completed",value=#lvlCompletedPets.." pets",inline=true},
+                        {name="Target",value="Level "..lvlTargetLevel,inline=true},
+                    })
+                end
+            end
+        end
+
+        --== LEVELING V2 UI ==--
+        do
+            local pd = getPetDataFromService(v2SelectedLeveling)
+            local petName = pd and (pd.name ~= "" and pd.name or pd.type) or "—"
+            local petAge  = pd and pd.age or 0
+            local mut     = pd and pd.mutation or "—"
+            local eqTxt   = v2PetEquipped and "YES" or "NO"
+            local qTxt    = #v2LevelingQueue > 0 and (v2CurrentQueueIndex.."/"..#v2LevelingQueue) or "0/0"
+            local modeTxt = v2AutoEnabled and "ON" or "OFF"
+            V2StatusLabel:Set(string.format(
+                "Mode: %s | Triggers: %d | Slot: %s | Pet: %s [%s] | Age: %d/%d | Queue: %s | Done: %d | Equipped: %s",
+                modeTxt, v2TriggerCount, slotTxt, petName, mut, petAge, v2TargetLevel, qTxt, #v2CompletedPets, eqTxt
+            ))
+        end
+
+        --== LEVELING V2 LOGIC ==--
+        if v2AutoEnabled and v2SelectedLeveling and #v2LevelingQueue > 0 then
+            local pd      = getPetDataFromService(v2SelectedLeveling)
+            local petAge  = pd and pd.age or 0
+            local petName = pd and (pd.name ~= "" and pd.name or pd.type) or "Unknown"
+            local petType = pd and pd.type or "Unknown"
+
+            if not v2PetEquipped then
+                pcall(function() PetsService:FireServer("EquipPet", v2SelectedLeveling) end)
+                v2PetEquipped = true
+            end
+
+            if petAge >= v2TargetLevel then
+                if v2PetEquipped then
+                    pcall(function() PetsService:FireServer("UnequipPet", v2SelectedLeveling) end)
+                    v2PetEquipped = false
+                end
+                Notify("Level Complete!", petName.." reached Level "..petAge.."!", 5)
+                sendWebhook("Level Complete!","Pet reached target level (V2)",5763719,{
+                    {name="Pet",value=petName,inline=true},{name="Type",value=petType,inline=true},
+                    {name="Level",value=tostring(petAge),inline=true},
+                    {name="Triggers",value=tostring(v2TriggerCount),inline=true},
+                    {name="Queue",value=v2CurrentQueueIndex.."/"..#v2LevelingQueue,inline=true},
+                })
+                table.insert(v2CompletedPets, v2SelectedLeveling)
+                if v2CurrentQueueIndex < #v2LevelingQueue then
+                    v2CurrentQueueIndex = v2CurrentQueueIndex + 1
+                    v2SelectedLeveling = v2LevelingQueue[v2CurrentQueueIndex]
+                    v2TriggerCount = 0
+                    local np = getPetDataFromService(v2SelectedLeveling)
+                    local npName = np and (np.name ~= "" and np.name or np.type) or "Unknown"
+                    Notify("Next Pet","Now leveling: "..npName.." ("..v2CurrentQueueIndex.."/"..#v2LevelingQueue..")",5)
+                else
+                    v2AutoEnabled = false
+                    V2AutoToggle:Set(false)
+                    Notify("ALL COMPLETE!","All "..#v2CompletedPets.." pets leveled!",15)
+                    sendWebhook("ALL COMPLETE!","All pets leveled! (V2)",5814783,{
+                        {name="Completed",value=#v2CompletedPets.." pets",inline=true},
+                        {name="Target",value="Level "..v2TargetLevel,inline=true},
+                    })
+                end
+            end
+        end
+
+        --== NIGHTMARE UI ==--
+        do
+            local pd = getPetDataFromService(nmSelectedLeveling)
+            local petName = pd and (pd.name ~= "" and pd.name or pd.type) or "—"
+            local petAge  = pd and pd.age or 0
+            local mut     = pd and pd.mutation or "—"
+            local eqTxt   = nmPetEquipped and "YES" or "NO"
+            local qTxt    = #levelingQueue > 0 and (currentQueueIndex.."/"..#levelingQueue) or "0/0"
+            local modeTxt = nmAutoEnabled and "ON" or "OFF"
+            NmStatusLabel:Set(string.format(
+                "Mode: %s | Phase: %s | CD: %s | Slot: %s | Pet: %s [%s] | Age: %d/%d | Queue: %s | Done: %d | Equipped: %s",
+                modeTxt, nmPhase, cdTxt, slotTxt, petName, mut, petAge, targetLevel, qTxt, #nmCompletedPets, eqTxt
+            ))
+        end
+
+        --== NIGHTMARE LEVELING PHASE ==--
+        if nmPhase == "LEVELING" and nmAutoEnabled and nmSelectedLeveling then
+            local pd      = getPetDataFromService(nmSelectedLeveling)
+            local petAge  = pd and pd.age or 0
+            local petName = pd and (pd.name ~= "" and pd.name or pd.type) or "Unknown"
+
+            if visualSlot == nmLevelingSlot and not nmPetEquipped then
+                pcall(function() PetsService:FireServer("EquipPet", nmSelectedLeveling, CFrame.new()) end)
+                nmPetEquipped = true
+                Notify("Pet Equipped", petName.." ("..currentQueueIndex.."/"..#levelingQueue..") - Leveling")
+            end
+
+            if visualSlot == nmMimicDilopSlot and nmPetEquipped then
+                pcall(function() PetsService:FireServer("UnequipPet", nmSelectedLeveling) end)
+                nmPetEquipped = false
+            end
+
+            if petAge >= targetLevel then
+                if nmPetEquipped then
+                    pcall(function() PetsService:FireServer("UnequipPet", nmSelectedLeveling) end)
+                    nmPetEquipped = false
+                end
+                nmPhase = "MUTATION"
+                nmMutationChecked = false
+                Notify("MUTATION PHASE", petName.." reached Lvl "..targetLevel.."! Going to mutation...", 5)
+                task.wait(0.5)
+                swapTo(visualToInternal(nmMutationSlot))
+            end
+        end
+
+        --== NIGHTMARE MUTATION PHASE ==--
+        if nmPhase == "MUTATION" and nmAutoEnabled and nmSelectedLeveling then
+            if visualSlot ~= nmMutationSlot then swapTo(visualToInternal(nmMutationSlot)) end
+
+            if visualSlot == nmMutationSlot and not nmPetEquipped then
+                pcall(function() PetsService:FireServer("EquipPet", nmSelectedLeveling, CFrame.new()) end)
+                nmPetEquipped = true
+                lastMutationResult = nil
+                lastMutationName   = nil
+                Notify("Mutation: Pet Equipped","Waiting for Headless skill...")
+            end
+
+            if nmPetEquipped and lastMutationResult then
+                task.wait(1)
+                local fp = getPetDataFromService(nmSelectedLeveling)
+                local fpName = fp and (fp.name ~= "" and fp.name or fp.type) or "Unknown"
+
+                if lastMutationResult == "Nightmare" then
+                    Notify("NIGHTMARE GET!", fpName.." got Nightmare! Moving to next pet...", 8)
+                    task.wait(1)
+                    pcall(function() PetsService:FireServer("UnequipPet", nmSelectedLeveling) end)
+                    nmPetEquipped = false
+                    lastMutationResult = nil
+                    lastMutationName   = nil
+                    table.insert(nmCompletedPets, nmSelectedLeveling)
+
+                    if currentQueueIndex < #levelingQueue then
+                        currentQueueIndex = currentQueueIndex + 1
+                        nmSelectedLeveling = levelingQueue[currentQueueIndex]
+                        nmPhase = "LEVELING"
+                        local np = getPetDataFromService(nmSelectedLeveling)
+                        local npName = np and (np.name ~= "" and np.name or np.type) or "Unknown"
+                        Notify("Next Pet!","Now leveling: "..npName.." ("..currentQueueIndex.."/"..#levelingQueue..")",5)
+                        task.wait(1)
+                        swapTo(visualToInternal(nmMimicDilopSlot))
+                    else
+                        nmAutoEnabled = false
+                        NmAutoToggle:Set(false)
+                        nmPhase = "LEVELING"
+                        Notify("ALL COMPLETE!","All "..#nmCompletedPets.." pets got Nightmare!",15)
+                    end
+                else
+                    Notify("Wrong Mutation", fpName.." got "..(lastMutationName or "Unknown")..", cleansing in 2s...", 5)
+                    task.wait(2)
+                    local ok, msg = applyCleansingShardToPet(nmSelectedLeveling)
+                    if ok then
+                        Notify("Cleansed!", fpName.." cleansed, back to leveling...", 5)
+                        task.wait(2)
+                        pcall(function() PetsService:FireServer("UnequipPet", nmSelectedLeveling) end)
+                        nmPetEquipped = false
+                        lastMutationResult = nil
+                        lastMutationName   = nil
+                        nmPhase = "LEVELING"
+                        task.wait(1)
+                        swapTo(visualToInternal(nmMimicDilopSlot))
+                    else
+                        Notify("Cleanse Failed", msg, 5)
+                        lastMutationResult = nil
+                        lastMutationName   = nil
+                    end
+                end
+            end
+        end
+
+        --== ELEPHANT UI ==--
+        do
+            local pd = getPetDataFromService(elSelectedLeveling)
+            local petName   = pd and (pd.name ~= "" and pd.name or pd.type) or "—"
+            local petAge    = pd and pd.age or 0
+            local petWeight = pd and pd.currentWeight or 0
+            local eqTxt     = elPetEquipped and "YES" or "NO"
+            local qTxt      = #elLevelingQueue > 0 and (elCurrentQueueIndex.."/"..#elLevelingQueue) or "0/0"
+            local modeTxt   = elAutoEnabled and "ON" or "OFF"
+            local mCd = mimicRemain and string.format("%.2fs", mimicRemain) or "—"
+            local eCd = elephantRemain and string.format("%.2fs", elephantRemain) or "—"
+            ElStatusLabel:Set(string.format(
+                "Mode: %s | Phase: %s | Mimic CD: %s | Elephant CD: %s | Slot: %s | Pet: %s | Age: %d/%d | Weight: %.2f KG | Blessings: %d | Queue: %s | Done: %d | Equipped: %s",
+                modeTxt, elPhase, mCd, eCd, slotTxt, petName, petAge, elTargetLevel, petWeight, elBlessingCount, qTxt, #elCompletedPets, eqTxt
+            ))
+        end
+
+        --== ELEPHANT LEVELING PHASE ==--
+        if elPhase == "LEVELING" and elAutoEnabled and elSelectedLeveling then
+            local pd      = getPetDataFromService(elSelectedLeveling)
+            local petAge  = pd and pd.age or 0
+            local petName = pd and (pd.name ~= "" and pd.name or pd.type) or "Unknown"
+
+            if visualSlot == elLevelingSlot and not elPetEquipped then
+                pcall(function() PetsService:FireServer("EquipPet", elSelectedLeveling, CFrame.new()) end)
+                elPetEquipped = true
+                Notify("Pet Equipped", petName.." ("..elCurrentQueueIndex.."/"..#elLevelingQueue..") - Leveling")
+            end
+
+            if visualSlot == elMimicDilopSlot and elPetEquipped then
+                pcall(function() PetsService:FireServer("UnequipPet", elSelectedLeveling) end)
+                elPetEquipped = false
+            end
+
+            if petAge >= elTargetLevel then
+                elPhase = "ELEPHANT"
+                lastElephantResult = nil
+                lastElephantWeight = nil
+                Notify("Level Reached!", petName.." reached Level "..elTargetLevel.."! Switching to Elephant...", 5)
+                if elPetEquipped then
+                    pcall(function() PetsService:FireServer("UnequipPet", elSelectedLeveling) end)
+                    elPetEquipped = false
+                end
+                task.wait(1)
+                swapTo(visualToInternal(elElephantSlot))
+            end
+        end
+
+        --== ELEPHANT BLESSING PHASE ==--
+        if elPhase == "ELEPHANT" and elAutoEnabled and elSelectedLeveling then
+            if visualSlot ~= elElephantSlot then swapTo(visualToInternal(elElephantSlot)) end
+
+            if visualSlot == elElephantSlot and not elPetEquipped then
+                pcall(function() PetsService:FireServer("EquipPet", elSelectedLeveling, CFrame.new()) end)
+                elPetEquipped = true
+                lastElephantResult = nil
+                lastElephantWeight = nil
+                Notify("Elephant: Pet Equipped","Waiting for Jumbo Blessing...")
+            end
+
+            if elPetEquipped and lastElephantResult then
+                task.wait(1)
+                local fp = getPetDataFromService(elSelectedLeveling)
+                local fpName   = fp and (fp.name ~= "" and fp.name or fp.type) or "Unknown"
+                local fpType   = fp and fp.type or "Unknown"
+                local fpWeight = fp and fp.currentWeight or 0
+
+                if lastElephantResult == "MaxWeight" then
+                    Notify("MAX WEIGHT!", fpName.." reached max weight cap!", 8)
+                    sendWebhook("Max Weight Reached!","Pet reached max weight cap!",16776960,{
+                        {name="Pet",value=fpName,inline=true},{name="Type",value=fpType,inline=true},
+                        {name="Weight",value=string.format("%.2f KG",fpWeight),inline=true},
+                        {name="Blessings",value=tostring(elBlessingCount),inline=true},
+                        {name="Queue",value=elCurrentQueueIndex.."/"..#elLevelingQueue,inline=true},
+                    })
+                    task.wait(1)
+                    pcall(function() PetsService:FireServer("UnequipPet", elSelectedLeveling) end)
+                    elPetEquipped = false
+                    lastElephantResult = nil
+                    lastElephantWeight = nil
+                    table.insert(elCompletedPets, elSelectedLeveling)
+
+                    if elCurrentQueueIndex < #elLevelingQueue then
+                        elCurrentQueueIndex = elCurrentQueueIndex + 1
+                        elSelectedLeveling = elLevelingQueue[elCurrentQueueIndex]
+                        elPhase = "LEVELING"
+                        elBlessingCount = 0
+                        local np = getPetDataFromService(elSelectedLeveling)
+                        local npName = np and (np.name ~= "" and np.name or np.type) or "Unknown"
+                        Notify("Next Pet","Now leveling: "..npName.." ("..elCurrentQueueIndex.."/"..#elLevelingQueue..")",5)
+                        task.wait(1)
+                        swapTo(visualToInternal(elMimicDilopSlot))
+                    else
+                        elAutoEnabled = false
+                        ElAutoToggle:Set(false)
+                        elPhase = "LEVELING"
+                        Notify("ALL COMPLETE!","All "..#elCompletedPets.." pets reached max weight!",15)
+                        sendWebhook("ALL COMPLETE!","All pets reached max weight!",5814783,{
+                            {name="Completed",value=#elCompletedPets.." pets",inline=true},
+                        })
+                    end
+
+                elseif lastElephantResult == "Blessed" then
+                    elBlessingCount = elBlessingCount + 1
+                    local wTxt = lastElephantWeight and string.format("%.2f KG", lastElephantWeight) or "N/A"
+                    Notify("Blessed!", fpName.." blessed! Weight: "..wTxt.." (Blessing #"..elBlessingCount..")", 5)
+                    task.wait(1)
+                    pcall(function() PetsService:FireServer("UnequipPet", elSelectedLeveling) end)
+                    elPetEquipped = false
+                    lastElephantResult = nil
+                    lastElephantWeight = nil
+                    elPhase = "LEVELING"
+                    task.wait(1)
+                    swapTo(visualToInternal(elMimicDilopSlot))
+                end
+            end
+        end
+
+        --== AUTO SLOT SWITCH ==--
+        local isLvlActive = lvlAutoEnabled
+        local isNmActive  = nmAutoEnabled and nmPhase == "LEVELING"
+        local isElActive  = elAutoEnabled and elPhase == "LEVELING"
+
+        if not isLvlActive and not isNmActive and not isElActive then
+            readyHoldTimer = 0
+        else
+            local dilopSlot, levelSlot
+            if isNmActive then
+                dilopSlot = nmMimicDilopSlot; levelSlot = nmLevelingSlot
+            elseif isElActive then
+                dilopSlot = elMimicDilopSlot; levelSlot = elLevelingSlot
+            else
+                dilopSlot = lvlMimicDilopSlot; levelSlot = lvlLevelingSlot
+            end
+
+            if visualSlot == dilopSlot then
+                if mimicRemain and mimicRemain <= READY_EPS then
+                    readyHoldTimer = readyHoldTimer + TICK_SEC
+                    if readyHoldTimer >= READY_HOLD_SEC then
+                        swapTo(visualToInternal(levelSlot))
+                        readyHoldTimer = 0
+                    end
+                else
+                    readyHoldTimer = 0
+                end
+            elseif visualSlot == levelSlot then
+                if mimicRemain and mimicRemain > READY_EPS then
+                    swapTo(visualToInternal(dilopSlot))
+                    readyHoldTimer = 0
+                end
+            end
+        end
+    end
+end)
+
+print("[GAG : Pet Leveling] Loaded successfully!")
+
